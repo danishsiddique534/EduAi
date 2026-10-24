@@ -1,0 +1,468 @@
+import asyncio
+import base64
+import json
+import logging
+import re
+import uuid
+from datetime import datetime, timezone
+from typing import Literal
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.auth import AuthUser, get_current_user
+from app.config import settings
+from app.database import get_db
+from app.models import SolvedPaperRecord
+from app.schemas import LevelId
+from app.security import read_validated_upload
+from app.services.documents import extract_document, format_page_text
+from app.services.llm import OmniRouteError, json_call
+from app.services.prompts import _LEVEL_INSTRUCTIONS
+from app.services import llm
+
+router = APIRouter(prefix="/api", tags=["solve"])
+logger = logging.getLogger(__name__)
+SolveMode = Literal["teach", "exam"]
+SolveStyle = Literal["Simple", "Exam", "Detailed"]
+
+
+class ExtractedQuestion(BaseModel):
+    number: int = Field(ge=1)
+    text: str = Field(min_length=1)
+    marks: int = Field(default=2, ge=1)
+
+
+class ExtractedQuestionSet(BaseModel):
+    questions: list[ExtractedQuestion]
+
+
+class SolutionBlock(BaseModel):
+    label: str
+    content: str
+
+
+class SolvedContent(BaseModel):
+    given: list[str] = Field(default_factory=list)
+    steps: list[str] = Field(default_factory=list)
+    therefore: str = ""
+    answer: str = ""
+    blocks: list[SolutionBlock] | None = None
+    hints: list[str] = Field(default_factory=list)
+
+
+class SolvedPaperQuestion(ExtractedQuestion):
+    solution: SolvedContent
+
+
+class SolvedPaper(BaseModel):
+    questions: list[SolvedPaperQuestion] = Field(min_length=1)
+
+
+class FollowUpQuestion(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    n: int
+    text: str
+    marks: int
+    status: Literal["solved", "review"] = "solved"
+    hints: list[str] = Field(default_factory=list)
+    solution: dict[str, object] = Field(default_factory=dict)
+
+
+class ResolveRequest(BaseModel):
+    question: FollowUpQuestion
+    text: str = Field(min_length=1, max_length=20_000)
+    level: LevelId
+    style: SolveStyle = "Exam"
+    mode: SolveMode = "exam"
+
+
+class FollowUpRequest(BaseModel):
+    kind: Literal["simpler", "method", "similar"]
+    question: FollowUpQuestion
+
+
+def _solved_paper_summary(record: SolvedPaperRecord) -> dict[str, object]:
+    return {
+        "id": record.id,
+        "title": record.title,
+        "subject": record.subject,
+        "mode": record.mode,
+        "style": record.style,
+        "question_count": record.question_count,
+        "created_at": record.created_at.isoformat(),
+    }
+
+
+_NUMBERED_QUESTION = re.compile(
+    r"(?m)^\s*(?:Q(?:uestion)?\s*)?(?P<number>\d{1,3})\s*[.)\:]\s+"
+)
+_MARKS = re.compile(r"[\[(]?\s*(\d{1,3})\s*(?:marks?|m)\s*[\])]?", re.I)
+
+
+def split_questions_regex(text: str) -> list[ExtractedQuestion]:
+    """Last-resort question splitter for text when structured extraction fails."""
+    text = re.sub(r"(?m)^\s*\[Page\s+\d+\]\s*$", "", text).strip()
+    matches = list(_NUMBERED_QUESTION.finditer(text))
+    questions: list[ExtractedQuestion] = []
+    if matches:
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            content = text[match.end() : end].strip()
+            marks_match = _MARKS.search(content)
+            marks = int(marks_match.group(1)) if marks_match else 2
+            content = re.sub(r"\s*(?:\[\s*\d+\s*marks?\s*\]|\(\s*\d+\s*marks?\s*\))\s*$", "", content, flags=re.I)
+            if content:
+                questions.append(
+                    ExtractedQuestion(number=int(match.group("number")), text=content, marks=marks)
+                )
+        if questions:
+            return questions
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    return [
+        ExtractedQuestion(number=index, text=paragraph, marks=2)
+        for index, paragraph in enumerate(paragraphs, start=1)
+    ]
+
+
+async def extract_questions(text: str) -> list[ExtractedQuestion]:
+    numbered_matches = list(_NUMBERED_QUESTION.finditer(text))
+    if len(numbered_matches) >= 2:
+        questions = split_questions_regex(text)
+        numbers = [question.number for question in questions]
+        if len(questions) == len(numbered_matches) and all(
+            current > previous for previous, current in zip(numbers, numbers[1:])
+        ):
+            return questions
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Act as an expert examiner. Extract every question exactly, with its "
+                "number and marks if visible. Return JSON only. Use the schema "
+                '{"questions":[{"number":1,"text":"...","marks":2}]}. '
+                "Do not answer or paraphrase the questions."
+            ),
+        },
+        {"role": "user", "content": f"Exam paper text:\n{text}"},
+    ]
+    try:
+        result = await json_call(messages, ExtractedQuestionSet, task="split")
+        if result.questions:
+            return sorted(result.questions, key=lambda question: question.number)
+    except (OmniRouteError, ValueError) as error:
+        logger.warning(
+            "Structured question extraction failed; using regex fallback: %s",
+            type(error).__name__,
+        )
+    return split_questions_regex(text)
+
+
+async def _solve_question(
+    question: ExtractedQuestion,
+    level: LevelId,
+    subject: str | None,
+    mode: SolveMode,
+    style: SolveStyle,
+) -> dict[str, object]:
+    subject_text = f" Subject: {subject}." if subject else ""
+    is_theory = bool(re.search(r"\b(?:define|what is|state|explain|describe|why)\b", question.text, re.I))
+    if mode == "teach":
+        format_instruction = (
+            "Return exactly two progressive hints before the full solution. "
+            "Do not reveal the final answer in either hint."
+        )
+    elif is_theory:
+        format_instruction = (
+            "For theory, structure blocks as Definition -> Explanation -> Example -> Conclusion. "
+            "Use those labels in blocks and give a concise final answer."
+        )
+    else:
+        format_instruction = (
+            "For mathematics, provide Given -> clear step-by-step working -> Therefore -> Answer. "
+            "Use LaTeX for mathematical expressions."
+        )
+    system = (
+        f"{_LEVEL_INSTRUCTIONS[level]}{subject_text}\n"
+        f"Answer style: {style}. {format_instruction}\n"
+        "Return a JSON object with keys given (string array), steps (string array), "
+        "therefore (string), answer (string), blocks (optional array of {label,content}), "
+        "and hints (exactly two short progressive hints). Be accurate and encouraging."
+    )
+    max_tokens_by_style = {"Simple": 1200, "Exam": 1800, "Detailed": 2800}
+    async with _question_semaphore:
+        solved = await json_call(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Question ({question.marks} marks): {question.text}"},
+            ],
+            SolvedContent,
+            task="solve",
+            max_tokens=(
+                max(max_tokens_by_style[style], 2200)
+                if mode == "teach"
+                else max_tokens_by_style[style]
+            ),
+        )
+    return _format_solved_question(question, solved)
+
+
+def _format_solved_question(
+    question: ExtractedQuestion,
+    solved: SolvedContent,
+) -> dict[str, object]:
+    is_theory = bool(re.search(r"\b(?:define|what is|state|explain|describe|why)\b", question.text, re.I))
+    hints = list(solved.hints[:2])
+    while len(hints) < 2:
+        hints.append(
+            "Identify what is given and which rule or formula connects it to the answer."
+            if not hints
+            else "Work through the next step carefully, then check your result."
+        )
+    blocks = solved.blocks
+    if is_theory:
+        explanation = " ".join(solved.steps) or solved.therefore or solved.answer
+        supplied = {block.label.casefold(): block.content for block in blocks or []}
+        defaults = {
+            "definition": solved.given[0] if solved.given else solved.answer,
+            "explanation": explanation,
+            "example": solved.given[1] if len(solved.given) > 1 else solved.answer,
+            "conclusion": solved.therefore or solved.answer,
+        }
+        blocks = [
+            SolutionBlock(label=label.title(), content=supplied.get(label, "") or defaults[label])
+            for label in ("definition", "explanation", "example", "conclusion")
+        ]
+    return {
+        "id": str(uuid.uuid4()),
+        "n": question.number,
+        "text": question.text,
+        "marks": question.marks,
+        "status": "solved",
+        "hints": hints,
+        "solution": {
+            "given": solved.given,
+            "steps": solved.steps,
+            "therefore": solved.therefore,
+            "answer": solved.answer,
+            **({"blocks": [block.model_dump() for block in blocks]} if blocks else {}),
+        },
+    }
+
+
+async def _solve_image_paper(
+    image: bytes,
+    filename: str,
+    level: LevelId,
+    subject: str | None,
+    mode: SolveMode,
+    style: SolveStyle,
+) -> list[dict[str, object]]:
+    extension = filename.rsplit(".", 1)[-1].lower()
+    media_type = "image/jpeg" if extension in {"jpg", "jpeg"} else "image/png"
+    image_url = (
+        f"data:{media_type};base64,{base64.b64encode(image).decode('ascii')}"
+    )
+    subject_text = f" Subject: {subject}." if subject else ""
+    answer_guidance = {
+        "Simple": "Give concise, easy-to-follow solutions.",
+        "Exam": "Write concise, mark-appropriate solutions suitable for an exam paper.",
+        "Detailed": "Give thorough explanations and show each important step.",
+    }[style]
+    mode_guidance = (
+        "Include exactly two progressive hints before revealing the full solution."
+        if mode == "teach"
+        else "Include two short study hints, but put the final answer in the solution."
+    )
+    result = await json_call(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Read the entire question-paper image, extract every question in "
+                    "order, and solve each one. Preserve the question wording and visible "
+                    "marks; use 2 marks only when none are shown. "
+                    f"{_LEVEL_INSTRUCTIONS[level]}{subject_text} "
+                    f"{answer_guidance} {mode_guidance} "
+                    "For theory, include definition, explanation, example, and conclusion "
+                    "blocks. For mathematics, show working and the final answer. "
+                    "Return JSON matching this shape: "
+                    '{"questions":[{"number":1,"text":"question text","marks":2,'
+                    '"solution":{"given":[],"steps":[],"therefore":"",'
+                    '"answer":"","blocks":[{"label":"Step","content":"..."}],'
+                    '"hints":["hint one","hint two"]}}]}.'
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Solve the question paper in this image."},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            },
+        ],
+        SolvedPaper,
+        task="multimodal",
+        max_tokens=8192,
+    )
+    return [
+        _format_solved_question(
+            ExtractedQuestion(number=item.number, text=item.text, marks=item.marks),
+            item.solution,
+        )
+        for item in result.questions
+    ]
+
+
+_question_semaphore = asyncio.Semaphore(settings.max_concurrent_llm)
+
+
+@router.post("/solve")
+async def solve_paper(
+    file: UploadFile = File(...),
+    level: LevelId = Form(default="c9-10"),
+    subject: str | None = Form(default=None),
+    mode: SolveMode = Form(default="exam"),
+    style: SolveStyle = Form(default="Exam"),
+    db: Session = Depends(get_db),
+    current_user: AuthUser = Depends(get_current_user),
+) -> list[dict[str, object]]:
+    filename, payload = await read_validated_upload(file)
+    if filename.rsplit(".", 1)[-1].lower() in {"jpg", "jpeg", "png"}:
+        try:
+            questions = await _solve_image_paper(
+                payload, filename, level, subject, mode, style
+            )
+        except OmniRouteError as error:
+            status_code = 413 if error.status_code == 413 else 503
+            raise HTTPException(status_code=status_code, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+    else:
+        try:
+            pages = await extract_document(payload, filename, file.content_type)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        source_text = format_page_text(pages)
+        if not source_text.strip():
+            raise HTTPException(status_code=422, detail="No readable text was found in the paper.")
+        extracted_questions = await extract_questions(source_text)
+        if not extracted_questions:
+            raise HTTPException(status_code=422, detail="No questions could be found in the paper.")
+        try:
+            questions = await asyncio.gather(
+                *(
+                    _solve_question(question, level, subject, mode, style)
+                    for question in extracted_questions
+                )
+            )
+        except OmniRouteError as error:
+            status_code = 413 if error.status_code == 413 else 503
+            raise HTTPException(status_code=status_code, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
+    record = SolvedPaperRecord(
+        id=str(uuid.uuid4()),
+        user_id=current_user.uid,
+        title=filename[:512],
+        subject=(subject or "Default")[:120],
+        mode=mode,
+        style=style,
+        question_count=len(questions),
+        questions_json=json.dumps(questions, ensure_ascii=False),
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(record)
+    db.commit()
+    return questions
+
+
+@router.get("/solve/history")
+async def solved_paper_history(
+    db: Session = Depends(get_db),
+    current_user: AuthUser = Depends(get_current_user),
+) -> list[dict[str, object]]:
+    records = db.scalars(
+        select(SolvedPaperRecord)
+        .where(SolvedPaperRecord.user_id == current_user.uid)
+        .order_by(SolvedPaperRecord.created_at.desc())
+        .limit(50)
+    ).all()
+    return [_solved_paper_summary(record) for record in records]
+
+
+@router.get("/solve/history/{paper_id}")
+async def get_solved_paper(
+    paper_id: str,
+    db: Session = Depends(get_db),
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, object]:
+    record = db.scalar(
+        select(SolvedPaperRecord).where(
+            SolvedPaperRecord.id == paper_id,
+            SolvedPaperRecord.user_id == current_user.uid,
+        )
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Solved paper not found.")
+    return {
+        **_solved_paper_summary(record),
+        "questions": json.loads(record.questions_json),
+    }
+
+
+@router.post("/solve/resolve")
+async def resolve_question(payload: ResolveRequest) -> dict[str, object]:
+    question = ExtractedQuestion(
+        number=payload.question.n,
+        text=payload.text,
+        marks=payload.question.marks,
+    )
+    try:
+        result = await _solve_question(
+            question, payload.level, None, payload.mode, payload.style
+        )
+    except OmniRouteError as error:
+        status_code = 413 if error.status_code == 413 else 503
+        raise HTTPException(status_code=status_code, detail=str(error)) from error
+    result["id"] = payload.question.id
+    return result
+
+
+@router.post("/solve/follow-up")
+async def solve_follow_up(payload: FollowUpRequest) -> str:
+    instructions = {
+        "simpler": (
+            "Explain the solution in simpler words at the learner's level. Keep the "
+            "mathematics correct and do not omit essential steps."
+        ),
+        "method": "Show a genuinely different valid method to solve the same question.",
+        "similar": (
+            "Write one similar practice question with changed values or context. "
+            "Include its answer in a short parenthetical check."
+        ),
+    }
+    try:
+        return await llm.chat(
+            [
+                {"role": "system", "content": instructions[payload.kind]},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {payload.question.text}\n"
+                        f"Current solution: {payload.question.solution}"
+                    ),
+                },
+            ],
+            task="solve",
+            temperature=0.3,
+        )
+    except OmniRouteError as error:
+        status_code = 413 if error.status_code == 413 else 503
+        raise HTTPException(status_code=status_code, detail=str(error)) from error
